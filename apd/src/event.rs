@@ -390,6 +390,7 @@ pub fn soft_reboot(superkey: Option<String>) -> Result<()> {
     // A real boot fires boot-completed once the framework is up; do the same.
     wait_boot_completed(Duration::from_secs(120));
     run_stage("boot-completed", superkey, false);
+    run_uid_monitor();
 
     Ok(())
 }
