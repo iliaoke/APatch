@@ -10,7 +10,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::{insmod, sepolicy};
+use crate::{event, insmod, sepolicy, utils};
 
 /// Parse a Kernel Module Interface (KMI) name like `android14-5.15` from a
 /// kernel release string, e.g. `5.15.123-android14-4-g12345678-abcd1234`.
@@ -101,21 +101,28 @@ fn read_from_assets(package: &str, name: &str) -> Result<Vec<u8>> {
 /// Loads the KernelPatch module for the device's kernel (auto-detecting the KMI
 /// and looking for `/data/adb/ap/{kmi}_kernelpatch.ko` when no module is given,
 /// loading straight from the `assets` folder of the manager APK when it is missing),
-/// then applies Magisk SELinux policy live and restarts the manager app so it
-/// re-initializes with the freshly granted root.
+/// then applies Magisk SELinux policy live, replays the module boot stages
+/// (mount, `post-mount`, `service`, `boot-completed`) and restarts the manager
+/// app so it re-initializes with the freshly granted root.
 pub fn run(
     module: Option<PathBuf>,
     kmi: Option<String>,
     package_name: Option<String>,
 ) -> Result<()> {
+    // Detach from the (adb/app) shell first: module stage scripts may outlive it,
+    // and adbd is restarted at the end of a magica jailbreak.
+    utils::daemonize()?;
+
     let kmi = kmi.or_else(detect_kmi);
     let name = module.as_ref().map(|m| m.display().to_string());
+    let mut freshly_loaded = false;
 
     // Skip if the module is already loaded (the manager restart re-triggers the
     // app-zygote, which would otherwise fail with EEXIST on a second load).
     if Path::new("/sys/module/kernelpatch").exists() {
         info!("kernelpatch module already loaded, skip loading");
     } else {
+        freshly_loaded = true;
         match module {
             Some(path) => insmod::insmod(&path, &[])?,
             None => {
@@ -143,6 +150,12 @@ pub fn run(
     // Mark jailbreak mode active.
     let _ = std::fs::create_dir_all("/data/adb/ap");
     let _ = std::fs::write("/data/adb/ap/jailbreak", "");
+
+    // Modules were skipped by the real boot; bring them up now. Never fatal.
+    // Only right after a fresh load: a re-run must not remount or respawn services.
+    if freshly_loaded && let Err(e) = event::on_late_load() {
+        warn!("late-load module stages failed: {e:#}");
+    }
 
     println!("late-load complete: {}", name.as_deref().unwrap_or("kernelpatch"));
 
